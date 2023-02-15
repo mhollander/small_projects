@@ -1,0 +1,232 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+# functions, setup
+library(rvest)
+library(tidyverse)
+library(lubridate)
+library(gmailr)
+
+# login to gmail
+gm_auth_configure(path = "/home/hollander/client_secret_231739076668-3i2fv7g0sj0nihqg1nd7ikvjs3bb7cqn.apps.googleusercontent.com.json")
+# get emails from moms and extract the ids
+emails <- gm_messages(search = "from=e-receipt@momsorganicmarket.com")
+mom_ids <- gm_id(emails)
+
+# parses a single email into its component columns. THe email is set up
+# in an html table that makes it look liek a receipt, but each row of data is 
+# in a single table cell, so we have to parse based on spaces and colons, etc
+parse_moms_email <- function(df) {
+  #browser()
+  df %>% 
+    # change <space>$ to <space><space>$)
+    mutate(X1 = if_else(!grepl("BOTTLE175", X1), gsub("\\s\\$", "  $", X1), X1),
+           # change @  $ to @ $, which fixes a mistake from the above line
+           X1 = gsub("@\\s+\\$", "@ $", X1)) %>% 
+    # split columns on double space or more
+    separate_wider_delim(cols = 1, 
+                         delim = regex("\\s{2,}"),
+                         names_sep = "_", 
+                         too_few = "align_end") %>% 
+    # mutate(X1_1 = if_else(grepl("\\d{3,}", X1_2), X1_2, X1_1),
+    #        X1_2 = if_else(grepl("\\d{3,}", X1_2), X1_3, X1_2),
+    #        X1_3 = if_else(!is.na(X1_2) & X1_2 == X1_3, gsub(".*(\\$\\d+\\.\\d+)\\s*$", "\\1", X1_2),X1_3)) %>%
+    # further separate based on a "@" symbol, which is used for weighed items
+    separate_wider_delim(cols = 3,
+                         delim = "@",
+                         names_sep = "_",
+                         too_few = "align_start") %>% 
+    # split : which is in the tare column
+    separate_wider_delim(cols = 3, 
+                         delim = ":",
+                         names_sep = "_", 
+                         too_few = "align_start") %>%
+    # rename columns
+    rename(code = X1_1, desc = X1_2, cost = X1_3_1_1, unit_cost = X1_3_2) %>%
+    mutate(code = if_else(cost == "Save", "SAVE", code),
+           desc = if_else(cost == "Save", "SAVE", desc),
+           cost = if_else(cost == "Save", X1_3_1_2, cost),
+           tare = if_else(cost == "Tare", X1_3_1_2, NA),
+           # create a weight and quantity column, using weights only when there is a weight delimiter (lb)
+           weight = if_else(!is.na(unit_cost) & grepl("lb", cost), trimws(gsub("lb", "", cost)), NA),
+           quantity = if_else(!is.na(unit_cost) & !grepl("lb", cost), cost, NA),
+           # this specifically deals with product purchased once; there is no unit cost listed on a new line so 
+           # we just fill in the unit cost from this line
+           unit_cost = case_when(code == "BOTTLE175" ~ cost,
+                                 code == "SAVE" ~ code,
+                                 !is.na(code) &  
+                                 ((!is.na(lead(n = 2, code)) &
+                                     is.na(lead(n=1, unit_cost))) | 
+                                    !is.na(lead(n = 1, code))) ~ cost,
+                                 .default = unit_cost),
+           quantity = if_else(!is.na(code) & code != "BOTTLE175" & 
+                                 ((!is.na(lead(n = 2, code)) & 
+                                     is.na(lead(n = 1, weight))) | 
+                                    !is.na(lead(n = 1, code))),
+                               "1", 
+                               quantity),
+           # fill in x for weight or quantity when the opposite one exists so that we 
+           # can later fill up to get weights into each main row
+           weight = if_else(!is.na(quantity), "x", weight),
+           quantity = if_else(!is.na(weight) & weight != "x", "x", quantity)) %>% 
+    fill(unit_cost, quantity, weight, tare, .direction = "up") %>% 
+    filter(!is.na(code),
+           grepl("^\\d{3,}|BOTTLE", code)) %>% 
+    # replace x with na
+    mutate(across(.cols = c(quantity, weight), .fns = ~na_if(.x, "x")),
+           # if there is no quantity specified, then set it to 1
+           quantity = if_else(is.na(quantity) & is.na(weight), "1", quantity)) %>% 
+    select(-X1_3_1_2) %>%
+    # turn columnsinto numerics
+    mutate(unit_cost = gsub("/lb", "", unit_cost), 
+           across(.cols = everything(), .fns = ~gsub("\\$", "", .x)),
+           across(.cols = c(cost, unit_cost, weight, quantity), .fns = as.numeric)) 
+}
+
+# opens an email message, grabs the body of the message and decodes it, then parses.
+# creates a df that has each item purchased as a row along with a message id and date
+get_email_df <- function(id) {
+  email <- gm_message(id, format = "full")
+  body <- email$payload$parts[[1]]$body$data
+  body_html <-rawToChar(base64enc::base64decode(gsub("-","+",gsub("_","/",body)))) %>% 
+    gsub("&nbsp;", " ", ., perl = T) %>% 
+    gsub("CRCKRS\\s+RGH", "CRCKRS RGH", .) 
+  body_df <- xml2::read_html(body_html) %>% html_elements(xpath = '//*[@class="ereceipt-body"]') %>% html_table() %>% as.data.frame()
+
+  # return NA if there isn't at least one weighted item. This happens when, e.g., we just buy beer
+  if(!(body_df %>% pull(X1) %>% grepl("/lb", .) %>% any())) {
+    base::message(glue::glue("Skipping {body_df[9,1]}"))
+    return(NULL)
+  } else {
+    parse_moms_email(body_df) %>% 
+      mutate(date = lubridate::as_datetime(trimws(gsub("-.*", "", gm_date(email))), format = "%a, %d %b %Y %H:%M:%S"),
+           email_id = id,
+           code_desc = paste(code, desc, sep = "_"))
+  }
+}
+```
+
+```{r, warning=FALSE}
+# get all emails in df form
+all_emails <- purrr::map_df(mom_ids, get_email_df)
+```
+
+# Basic Info
+
+```{r}
+total_weeks <- all_emails %>% distinct(date) %>% nrow
+total_items <- all_emails %>% distinct(code) %>% nrow
+
+weekly_sum <- all_emails %>% 
+  group_by(date) %>% 
+  summarize(n = n(),
+            cost = sum(cost),
+            diff_items = n_distinct(code),
+            is_coffee_purchased = any(grepl("^MOM's ORG", desc)),
+            coffee_weight = sum(weight[grepl("^MOM's ORG", desc)], na.rm = 0)) %>% 
+  summarize(total_receipts = n(),
+            total_cost = sum(cost),
+            first_receipt = as.Date(min(date)),
+            last_receipt = as.Date(max(date)),
+            mean_items = mean(n),
+            med_items = median(n),
+            fewest_items = min(n),
+            most_items = max(n),
+            mean_cost = mean(cost),
+            med_cost = median(cost),
+            min_cost = min(cost),
+            max_cost = max(cost),
+            prop_coffee_purchase = mean(is_coffee_purchased),
+            mean_coffee_purchased = mean(coffee_weight, na.rm = T))
+```
+
+-   This MOM's shopping summary comprises `r total_weeks` shopping trips, from `r format(weekly_sum$first_receipt, "%m/%d/%Y")` `r format(weekly_sum$last_receipt, "%m/%d/%Y")`
+-   During this time, we spent `r scales::dollar_format()(weekly_sum$total_cost)` at MOM's. Our average weekly receipt was `r scales::dollar_format()(weekly_sum$mean_cost)`; our highest recepit was `r scales::dollar_format()(weekly_sum$max_cost)`
+-   We usually bought `r round(weekly_sum$mean_items)`, but once bought `r weekly_sum$most_items`
+-   We bought coffee `r scales::percent_format(accuracy = 1)(weekly_sum$mean_coffee_purchased)` of the time; on average we bought `r round(weekly_sum$mean_coffee_purchased, 2)` lbs of coffee.
+
+
+# Changes in our bill over time
+
+The graph below shows the total receipt amount each week, with highlighting during the pandemic period (through the kids' getting vaccinated). Our bills were doubled during this period b/c we were buying for 2 weeks at a time to reduce in store exposure to COVID.
+
+```{r}
+all_emails %>% 
+  group_by(date) %>% 
+  summarize(cost = sum(cost)) %>% 
+  ggplot(aes(x = as.Date(date), y = cost)) +
+  geom_point() +
+  scale_y_continuous(label = scales::dollar_format()) +
+  annotate("rect", xmin = ymd("2020-03-16"), xmax = ymd("2021-12-15"), ymin = -Inf, ymax = Inf,
+           fill = "red", alpha = .2) + 
+  labs(title = "Weekly grocery bill cost",
+       subtitle = "Shading marks the beginning of the pandemic through the kids vaccination",
+       x = "", y = "") + 
+  theme_minimal() + 
+    theme(legend.position = "none")
+
+```
+
+
+The small multiples below show % changes in price for the top 20 items that we purchased during this time period over time. The biggest price increases came from potatoes, onions, and canned tomatoes. Broccoli was all over the map in terms of pricing. Other items, like our cereal flakes, had a steady increase in price over time with occassional sales. Looking at the graph for tomatoes, it is hard to tell if there was a sale the first week and there really hasn't been a huge price rise.
+
+```{r, fig.width = 10, fig.height = 10}
+all_emails %>% 
+  filter(code_desc %in% (a %>% slice_max(order_by = purchases, n = 20) %>% pull(code_desc))) %>% 
+  distinct(code, desc, date, .keep_all = T) %>% 
+  group_by(code, desc) %>% 
+  arrange(code, date) %>% 
+  mutate(change = (unit_cost - first(unit_cost))/first(unit_cost),
+         code_desc = paste(code, desc, sep = "_")) %>% 
+  complete(date) %>% 
+  filter(code != "BOTTLE175") %>% 
+  ungroup() %>% 
+  ggplot(aes(x = date, y = change, color = code_desc)) +
+  geom_point() +
+  scale_y_continuous(label = scales::percent) +
+  facet_wrap(~desc, ncol = 4) + 
+  labs(title = "Price change from first purchase",
+       x = "", y = "") + 
+  theme_minimal() + 
+    theme(legend.position = "none")
+
+```
+
+
+```{r}
+weight_sum <- all_emails %>% 
+  filter(weight > 0) %>% 
+  group_by(code_desc, desc) %>% 
+  summarize(avg_weight = mean(weight),
+            total = sum(weight),
+            avg_price = mean(cost)) %>% 
+  arrange(desc(total)) %>% 
+  ungroup()
+```
+In terms of weight, we bought more bananas, potatoes, and onions than any other food:
+
+```{r}
+weight_sum %>% 
+  slice_max(total, n = 10) %>% 
+  gt::gt()
+```
+
+
+```{r}
+# price changes over time
+a <- all_emails %>% 
+  group_by(code_desc) %>% 
+  arrange(date) %>% 
+  summarize(min_price = min(unit_cost, na.rm = T),
+            max_price = max(unit_cost, na.rm = T),
+            first_price = first(unit_cost),
+            last_price = last(unit_cost),
+            purchases = n()) %>%
+  ungroup() %>% 
+  mutate(prop_overall_change = (max_price - min_price) / min_price,
+         prop_time_change = (last_price - first_price) / first_price)
+```
