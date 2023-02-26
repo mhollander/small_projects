@@ -30,7 +30,7 @@ rolling_victims <- function(df) {
            name = factor(name, levels = c("fs", "fs_7_day", "fs_30_day", "fs_90_day", "nfs", "nfs_7_day", "nfs_30_day", "nfs_90_day")))
 }
 
-rolling_shooting_victims_plot <- function(df, ...) {
+rolling_shooting_victims_plot <- function(df, pre_pan_avg = T, ...) {
   
   
   df <- df %>% 
@@ -40,16 +40,13 @@ rolling_shooting_victims_plot <- function(df, ...) {
   max_y <- df %>% pull(value) %>% max(na.rm = T)
   max_avg <- df %>% distinct(prepandemic_avg) %>% pull() %>% max(na.rm = T)
   
-  df %>%
+  plot <- df %>%
     ggplot(aes(x = as.Date(date_), y = value, color = name)) +
     geom_point(alpha = .5, size = .8) +
     geom_hline(data = . %>% distinct(prepandemic_avg, name, .keep_all = T), 
                aes(yintercept = prepandemic_avg, color = name)) +
     geom_vline(aes(xintercept = ymd("2020-03-11")), color = "red", linetype = "dashed", alpha = .5) +
     annotate("text", x = ymd("2020-02-15"), y = Inf, angle = 90, label = "COVID-19 Pandemic Declared", vjust = "left", hjust = "right", alpha = .5) +
-    annotate("text", x = ymd("2016-01-01"), y = .8*max_y, alpha = .5, label = "Pre-pandemic average", vjust = "top", hjust = "left") +
-    annotate("curve", x = ymd("2016-10-01"), xend = ymd("2019-01-01"), y = .77*max_y, yend = max_avg * 1.01,
-             arrow = arrow(length = unit(0.02, "npc")), curvature = -.35, alpha = .5) +
     scale_color_discrete(labels = c("fs" = "Daily", "nfs" = "Daily", "fs_7_day" = "7 day", "fs_30_day" = "30 day",
                                     "fs_90_day" = "90 day", "nfs_7_day" = "7 day", "nfs_30_day" = "30 day",
                                     "nfs_90_day" = "90 day")) + 
@@ -57,14 +54,54 @@ rolling_shooting_victims_plot <- function(df, ...) {
     labs(...,
          x = "", y = "", color = "Shooting Count: ") +
     theme_minimal() + 
-    theme(plot.title = element_text(size = 20, face = "bold"),
+    theme(strip.text = element_text(size = 14),
+          plot.title = element_text(size = 20, face = "bold"),
           plot.subtitle = element_text(size = 17, face = "bold"),
           axis.text = element_text(size = 16),
           axis.ticks = element_blank(),
           legend.position = "top",
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14, face = "bold"))
+  
+  if(pre_pan_avg) { 
+    plot <- plot +    
+      annotate("text", x = ymd("2016-01-01"), y = .8*max_y, alpha = .5, label = "Pre-pandemic average", vjust = "top", hjust = "left") +
+      annotate("curve", x = ymd("2016-10-01"), xend = ymd("2019-01-01"), y = .77*max_y, yend = max_avg * 1.01,
+             arrow = arrow(length = unit(0.02, "npc")), curvature = -.35, alpha = .5) 
+  }
+  
+  return(plot)
+    
 }
+
+# computes rolling counts by district; this creates far more rows b/c you need multiple 
+# rows for each district for each time period; 
+rolling_victims_by_district <- function(df) {
+  df %>% 
+    mutate(district = if_else(is.na(dc_key), "Unknown", as.character(substr(dc_key, 5,6)))) %>% 
+    complete(date_ = seq(min(date_), 
+                         max(date_), by = '1 day'), fatal, district) %>% 
+    group_by(date_, district) %>% 
+    summarize(fs = sum(fatal == 1 & !is.na(objectid), na.rm = T),
+              nfs = sum(fatal == 0 & !is.na(objectid), na.rm = T)) %>% 
+    replace_na(list(fs = 0, nfs = 0)) %>%
+    group_by(district) %>% 
+    arrange(date_) %>% 
+    mutate(across(.cols = c(fs, nfs), .fns = list(~RcppRoll::roll_sum(.x, n = 7, fill = NA),
+                                                  ~RcppRoll::roll_sum(.x, n = 30, fill = NA),
+                                                  ~RcppRoll::roll_sum(.x, n = 90, fill = NA)))) %>% 
+    rename(fs_7_day = fs_1,
+           fs_30_day = fs_2,
+           fs_90_day = fs_3,
+           nfs_7_day = nfs_1,
+           nfs_30_day = nfs_2,
+           nfs_90_day = nfs_3,
+    ) %>% 
+    pivot_longer(names_to = "name", values_to = "value",  cols = -c(date_, district)) %>% 
+    mutate(type = if_else(grepl("^fs", name), "Fatal", "Non-Fatal"),
+           name = factor(name, levels = c("fs", "fs_7_day", "fs_30_day", "fs_90_day", "nfs", "nfs_7_day", "nfs_30_day", "nfs_90_day")))
+}
+
 
 rolling_shooting_victims_plot(shooting_victims %>%
                                 rolling_victims() %>% 
@@ -157,3 +194,50 @@ shooting_victims %>%
   facet_wrap(~name, ncol = 1, scales = "free_y") +
   labs(title = "Days Without a Shooting in Philadelphia",
        x = "", y = "")
+
+
+
+
+rolling_shooting_victims_plot(shooting_victims %>%
+                                rolling_victims_by_district() %>% 
+                                filter(grepl("^nfs", name)),
+                              pre_pan_avg = F,
+                              title = "Non-Fatal Shootings in Philadelphia",
+                              subtitle = "1-, 7-, 30, and 90-Day Counts") +
+  facet_wrap(~district, ncol = 5)
+
+ggsave("non-fatal_90_day_facet.png", width = 18, height = 14, bg = "white")
+
+rolling_shooting_victims_plot(shooting_victims %>%
+                                rolling_victims_by_district() %>% 
+                                filter(grepl("^nfs", name)),
+                              pre_pan_avg = F,
+                              title = "Non-Fatal Shootings in Philadelphia",
+                              subtitle = "1-, 7-, 30, and 90-Day Counts") +
+  facet_wrap(~district, ncol = 5, scales = "free_y") 
+
+ggsave("non-fatal_90_day_facet.png", width = 18, height = 14, bg = "white")
+
+
+rolling_shooting_victims_plot(shooting_victims %>%
+                                rolling_victims_by_district() %>% 
+                                filter(grepl("^nfs", name),
+                                       !grepl("90", name)),
+                              pre_pan_avg = F,
+                              title = "Non-Fatal Shootings in Philadelphia",
+                              subtitle = "1-, 7-, and 30-Day Counts") +
+  facet_wrap(~district, ncol = 5)
+
+ggsave("non-fatal_60_day_facet.png", width = 18, height = 14, bg = "white")
+
+rolling_shooting_victims_plot(shooting_victims %>%
+                                rolling_victims_by_district() %>% 
+                                filter(grepl("^nfs", name),
+                                       !grepl("90", name)),
+                              pre_pan_avg = F,
+                              title = "Non-Fatal Shootings in Philadelphia",
+                              subtitle = "1-, 7-, and 30-Day Counts") +
+  facet_wrap(~district, ncol = 5, scales = "free_y") 
+
+
+ggsave("non-fatal_60_day_facet_free_y.png", width = 22, height = 14, bg = "white")
