@@ -74,18 +74,37 @@ rolling_shooting_victims_plot <- function(df, pre_pan_avg = T, ...) {
     
 }
 
-# computes rolling counts by district; this creates far more rows b/c you need multiple 
-# rows for each district for each time period; 
+
 rolling_victims_by_district <- function(df) {
   df %>% 
     mutate(district = if_else(is.na(dc_key), "Unknown", as.character(substr(dc_key, 5,6)))) %>% 
+    rolling_victims_by_group(district)
+}
+
+rolling_victims_by_age <- function(df) {
+  df %>% 
+    mutate(victim_age = case_when(age < 18 ~ "<18",
+                                  age < 22 ~ "18-21",
+                                  age < 26 ~ "22-25",
+                                  age < 31 ~ "26-30",
+                                  age < 41 ~ "31-40",
+                                  age < 51 ~ "41-50",
+                                  TRUE ~ "51+")) %>% 
+    rolling_victims_by_group(victim_age)
+}
+
+
+# computes rolling counts by district; this creates far more rows b/c you need multiple 
+# rows for each district for each time period; 
+rolling_victims_by_group <- function(df, ...) {
+  df %>% 
     complete(date_ = seq(min(date_), 
-                         max(date_), by = '1 day'), fatal, district) %>% 
-    group_by(date_, district) %>% 
+                         max(date_), by = '1 day'), fatal, ...) %>% 
+    group_by(date_, ...) %>% 
     summarize(fs = sum(fatal == 1 & !is.na(objectid), na.rm = T),
               nfs = sum(fatal == 0 & !is.na(objectid), na.rm = T)) %>% 
     replace_na(list(fs = 0, nfs = 0)) %>%
-    group_by(district) %>% 
+    group_by(...) %>% 
     arrange(date_) %>% 
     mutate(across(.cols = c(fs, nfs), .fns = list(~RcppRoll::roll_sum(.x, n = 7, fill = NA),
                                                   ~RcppRoll::roll_sum(.x, n = 30, fill = NA),
@@ -97,9 +116,10 @@ rolling_victims_by_district <- function(df) {
            nfs_30_day = nfs_2,
            nfs_90_day = nfs_3,
     ) %>% 
-    pivot_longer(names_to = "name", values_to = "value",  cols = -c(date_, district)) %>% 
+    pivot_longer(names_to = "name", values_to = "value",  cols = -c(date_, ...)) %>% 
     mutate(type = if_else(grepl("^fs", name), "Fatal", "Non-Fatal"),
-           name = factor(name, levels = c("fs", "fs_7_day", "fs_30_day", "fs_90_day", "nfs", "nfs_7_day", "nfs_30_day", "nfs_90_day")))
+           name = factor(name, levels = c("fs", "fs_7_day", "fs_30_day", "fs_90_day", "nfs", "nfs_7_day", "nfs_30_day", "nfs_90_day"))) %>%
+    ungroup()
 }
 
 
@@ -241,3 +261,24 @@ rolling_shooting_victims_plot(shooting_victims %>%
 
 
 ggsave("non-fatal_60_day_facet_free_y.png", width = 22, height = 14, bg = "white")
+
+
+rolling_shooting_victims_plot(shooting_victims %>%
+                                rolling_victims_by_age() %>% 
+                                filter(grepl("^nfs", name)),
+                              pre_pan_avg = F,
+                              title = "Non-Fatal Shootings in Philadelphia by Victim Age",
+                              subtitle = "1-, 7-, 30, and 90-Day Counts") +
+  facet_wrap(~victim_age, ncol = 2)
+
+ggsave("non-fatal_by_age.png", width = 22, height = 14, bg = "white")
+
+rolling_shooting_victims_plot(shooting_victims %>%
+                                rolling_victims_by_age() %>% 
+                                filter(grepl("^fs", name)),
+                              pre_pan_avg = F,
+                              title = "Fatal Shootings in Philadelphia by Victim Age",
+                              subtitle = "1-, 7-, 30, and 90-Day Counts") +
+  facet_wrap(~victim_age, ncol = 2)
+
+ggsave("fatal_by_age_facet.png", width = 22, height = 14, bg = "white")
